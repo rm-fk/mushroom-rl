@@ -1,5 +1,6 @@
 import os
 
+import numpy as np
 import torch
 import warp as wp
 
@@ -15,10 +16,13 @@ class Go2Base(MuJoCoWarp):
 
     Holds everything that is a property of the robot rather than of a task:
     the model, the joint and actuator specification, the mapping from policy
-    actions to joint torques, and the health check used for termination.
+    actions to joint torques, the health check used for termination, and the
+    domain randomisation applied on reset and during episodes.
 
-    Task classes derive from this and supply reward, is_absorbing and the
-    task specific parts of the observation. See Go2Walk.
+    Follows the structure of the IsaacSim A1Walking environment, which in
+    turn resembles Rudin et al., "Learning to Walk in Minutes Using Massively
+    Parallel Deep Reinforcement Learning". Task classes derive from this and
+    supply reward, is_absorbing and the task specific observations.
 
     """
 
@@ -55,21 +59,24 @@ class Go2Base(MuJoCoWarp):
         "RR_calf",
     ]
 
-    FEET = ["FL", "FR", "RL", "RR"]
+    # Foot geoms, used for the contact proxy. Spheres of radius 0.022.
+    FEET_GEOMS = ["FL", "FR", "RL", "RR"]
 
     def __init__(
         self,
         num_envs,
         gamma=0.99,
         horizon=1000,
-        healthy_z_range=(0.18, 0.45),
+        healthy_z_range=(0.15, 0.45),
         healthy_gravity_z=-0.6,
         terminate_when_unhealthy=True,
         action_scale=0.25,
-        kp=25.0,
+        kp=20.0,
         kd=0.5,
         soft_joint_limit=0.9,
-        reset_noise_scale=0.05,
+        domain_randomization=True,
+        push_interval=750,
+        push_max_vel=1.0,
         n_substeps=1,
         n_intermediate_steps=10,
         use_graph_capture=False,
@@ -95,16 +102,18 @@ class Go2Base(MuJoCoWarp):
             kd (float): derivative gain of the joint position controller;
             soft_joint_limit (float): fraction of the joint range, centred on
                 its midpoint, outside of which a limit penalty may apply;
-            reset_noise_scale (float): scale of the uniform noise added to the
-                default joint pose on reset;
+            domain_randomization (bool): whether to randomise the initial pose
+                and apply random pushes during episodes;
+            push_interval (int): mean number of steps between random pushes;
+            push_max_vel (float): magnitude bound of the velocity applied by a
+                push, in m/s;
             n_substeps (int): physics steps per intermediate step;
             n_intermediate_steps (int): intermediate steps per environment
                 step. The PD controller is evaluated once per intermediate
-                step, so this is what sets the control rate. Together with
-                n_substeps and the 0.002 s model timestep, the defaults give a
-                500 Hz control loop and a 50 Hz policy rate. Running the PD at
-                the policy rate instead leaves the joints underdamped and the
-                robot oscillates itself over;
+                step, so this sets the control rate. With the 0.002 s model
+                timestep the defaults give a 500 Hz control loop and a 50 Hz
+                policy rate. Running the PD at the policy rate instead leaves
+                the joints underdamped and the robot oscillates itself over;
             scene (str): scene file to load. The mjx variant uses a reduced
                 solver iteration count and carries IMU sensors, which suits
                 batched GPU simulation.
@@ -114,11 +123,14 @@ class Go2Base(MuJoCoWarp):
             os.path.dirname(os.path.abspath(path_robots)), "data", "go2", scene
         )
 
-        observation_spec = [("base_pose", "base", ObservationType.JOINT_POS)]
+        # Base velocity in the base frame, then joint positions and
+        # velocities. World position and orientation are deliberately not
+        # observed: the policy sees orientation only through the projected
+        # gravity vector, which is what an IMU provides on the real robot.
+        observation_spec = [("base_vel", "base", ObservationType.BODY_VEL)]
         observation_spec += [
             (f"{j}_pos", j, ObservationType.JOINT_POS) for j in self.LEG_JOINTS
         ]
-        observation_spec += [("base_vel", "base", ObservationType.JOINT_VEL)]
         observation_spec += [
             (f"{j}_vel", j, ObservationType.JOINT_VEL) for j in self.LEG_JOINTS
         ]
@@ -126,11 +138,6 @@ class Go2Base(MuJoCoWarp):
         additional_data_spec = [
             ("base_pos", "base", ObservationType.BODY_POS),
             ("base_rot", "base", ObservationType.BODY_ROT),
-            ("base_vel_world", "base", ObservationType.BODY_VEL_WORLD),
-            ("base_vel_local", "base", ObservationType.BODY_VEL),
-        ]
-        additional_data_spec += [
-            (f"{f}_pos", f"{f}_calf", ObservationType.BODY_POS) for f in self.FEET
         ]
 
         self._healthy_z_range = healthy_z_range
@@ -140,7 +147,9 @@ class Go2Base(MuJoCoWarp):
         self._kp = kp
         self._kd = kd
         self._soft_joint_limit = soft_joint_limit
-        self._reset_noise_scale = reset_noise_scale
+        self._domain_randomization = domain_randomization
+        self._push_interval = push_interval
+        self._push_max_vel = push_max_vel
 
         # Must precede super().__init__(): the parent calls _modify_mdp_info
         # partway through its own constructor, and subclasses use this there.
@@ -163,48 +172,68 @@ class Go2Base(MuJoCoWarp):
         )
 
         self._device = wp.to_torch(self._data_wp.qpos).device
+        dev = self._device
 
         # Nominal standing pose, taken from the "home" keyframe of the MJCF.
         # qpos0 has the legs fully extended and the base at 0.445, which is
         # not a pose the robot can hold; the keyframe is the one to use.
         key_qpos = torch.as_tensor(
-            self._model.key_qpos[0], dtype=torch.float32, device=self._device
+            self._model.key_qpos[0], dtype=torch.float32, device=dev
         )
         self._default_qpos = key_qpos
         self._default_joint_pos = key_qpos[7:].clone()
 
         # Leg dofs in qvel, after the six free joint dofs.
-        self._leg_dof_idx = torch.arange(6, 6 + self._n_joints, device=self._device)
+        self._leg_dof_idx = torch.arange(6, 6 + self._n_joints, device=dev)
 
-        # Joint limits from the model, shrunk towards the midpoint by
-        # soft_joint_limit. Joint 0 is the free joint and is skipped.
+        # Joint limits from the model. Joint 0 is the free joint and is
+        # skipped. The soft limits are shrunk towards the midpoint.
         rng = torch.as_tensor(
-            self._model.jnt_range[1:], dtype=torch.float32, device=self._device
+            self._model.jnt_range[1:], dtype=torch.float32, device=dev
         )
+        self._joint_lower = rng[:, 0]
+        self._joint_upper = rng[:, 1]
         mid = 0.5 * (rng[:, 0] + rng[:, 1])
         half = 0.5 * (rng[:, 1] - rng[:, 0]) * soft_joint_limit
-        self._joint_lower = mid - half
-        self._joint_upper = mid + half
+        self._soft_joint_lower = mid - half
+        self._soft_joint_upper = mid + half
+
+        # Torque limits from the actuator ctrlrange.
+        self._effort_limit = torch.as_tensor(
+            self._model.actuator_ctrlrange[:, 1], dtype=torch.float32, device=dev
+        )
+
+        self._feet_geom_ids = torch.as_tensor(
+            [self._model.geom(g).id for g in self.FEET_GEOMS], device=dev
+        )
+
+        # The action is a joint position offset scaled by action_scale, so
+        # the action space is the joint range expressed in those units.
+        low = (self._joint_lower - self._default_joint_pos) / action_scale
+        high = (self._joint_upper - self._default_joint_pos) / action_scale
+        self.info.action_space = Box(low, high)
+
+        self._actions = torch.zeros(num_envs, self._n_joints, device=dev)
+        self._episode_length = torch.zeros(num_envs, dtype=torch.long, device=dev)
 
     # ------------------------------------------------------------------
     # MDP info / observation layout
     # ------------------------------------------------------------------
 
     def _modify_mdp_info(self, mdp_info):
-        # The policy must not see absolute world position: x and y of the
-        # free joint carry no task information and prevent generalisation.
-        self.obs_helper.remove_obs("base_pose", 0)
-        self.obs_helper.remove_obs("base_pose", 1)
-
         # Contiguous slices of the joint positions and velocities in the
-        # observation, for use by subclasses. Computed after remove_obs so
-        # the indices are final.
+        # observation, for use by subclasses.
         first_pos = self.obs_helper.obs_idx_map[f"{self.LEG_JOINTS[0]}_pos"][0]
         last_pos = self.obs_helper.obs_idx_map[f"{self.LEG_JOINTS[-1]}_pos"][-1]
         first_vel = self.obs_helper.obs_idx_map[f"{self.LEG_JOINTS[0]}_vel"][0]
         last_vel = self.obs_helper.obs_idx_map[f"{self.LEG_JOINTS[-1]}_vel"][-1]
         self._joint_pos_slice = slice(first_pos, last_pos + 1)
         self._joint_vel_slice = slice(first_vel, last_vel + 1)
+
+        # BODY_VEL is ordered [angular(3), linear(3)].
+        base_vel = self.obs_helper.obs_idx_map["base_vel"]
+        self._ang_vel_slice = slice(base_vel[0], base_vel[0] + 3)
+        self._lin_vel_slice = slice(base_vel[0] + 3, base_vel[0] + 6)
 
         mdp_info = super()._modify_mdp_info(mdp_info)
         mdp_info.observation_space = Box(*self.obs_helper.get_obs_limits())
@@ -215,34 +244,52 @@ class Go2Base(MuJoCoWarp):
     # ------------------------------------------------------------------
 
     def _preprocess_action(self, action):
-        # Keep the policy action as is. The PD loop lives in _compute_action
-        # so that reward() sees the raw action rather than the torques.
-        return torch.as_tensor(action, dtype=torch.float32, device=self._device)
+        action = torch.as_tensor(action, dtype=torch.float32, device=self._device)
+        action = torch.clamp(action, min=-100.0, max=100.0)
+        self._actions[:] = action
+        return action
 
     def _compute_action(self, obs, action):
         """
         Map a policy action to joint torques through a PD controller.
 
-        The action is a joint position offset relative to the default pose,
-        as in the usual legged locomotion setup. The MJCF ships plain torque
-        actuators, so the position loop is closed here rather than by MuJoCo.
+        The action is a joint position offset relative to the default pose.
+        The MJCF ships plain torque actuators, so the position loop is closed
+        here rather than by MuJoCo. Overriding this method makes the base
+        class recompute the torques once per intermediate step.
 
-        Overriding this method makes the base class recompute the torques
-        once per intermediate step. Moving the PD loop into the MJCF as
-        <position> actuators would run it inside the solver and inside the
-        captured graph, which removes n_intermediate_steps Python calls per
-        environment step. That is the recommended upgrade before scaling to
-        large num_envs.
+        Moving the PD loop into the MJCF as <position> actuators would run it
+        inside the solver and inside the captured graph, which removes
+        n_intermediate_steps Python calls per environment step. That is the
+        recommended upgrade before scaling to large num_envs.
 
         """
-        qpos = wp.to_torch(self._data_wp.qpos)
-        qvel = wp.to_torch(self._data_wp.qvel)
-
-        joint_pos = qpos[:, 7:]
-        joint_vel = qvel[:, self._leg_dof_idx]
+        joint_pos = self._joint_pos()
+        joint_vel = self._joint_vel()
 
         target = self._default_joint_pos + self._action_scale * action
-        return self._kp * (target - joint_pos) - self._kd * joint_vel
+        torque = self._kp * (target - joint_pos) - self._kd * joint_vel
+        return torch.clamp(torque, -self._effort_limit, self._effort_limit)
+
+    # ------------------------------------------------------------------
+    # Quaternion helpers (w, x, y, z), batched over environments
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quat_rotate(q, v):
+        w, xyz = q[:, :1], q[:, 1:]
+        c = torch.cross(xyz, v, dim=-1)
+        return v + 2.0 * w * c + 2.0 * torch.cross(xyz, c, dim=-1)
+
+    @staticmethod
+    def _quat_rotate_inverse(q, v):
+        w, xyz = q[:, :1], q[:, 1:]
+        c = torch.cross(xyz, v, dim=-1)
+        return v - 2.0 * w * c + 2.0 * torch.cross(xyz, c, dim=-1)
+
+    @staticmethod
+    def _wrap_to_pi(angles):
+        return torch.atan2(torch.sin(angles), torch.cos(angles))
 
     # ------------------------------------------------------------------
     # Robot state helpers
@@ -250,34 +297,24 @@ class Go2Base(MuJoCoWarp):
 
     def _projected_gravity(self):
         """
-        Gravity direction expressed in the base frame.
+        Gravity direction expressed in the base frame. (num_envs, 3)
 
-        Returns a (num_envs, 3) tensor. The z component is -1 when the robot
-        is upright and rises towards 0 as it tips onto its side, which makes
-        it a convenient orientation health check and a standard policy input.
+        The z component is -1 when the robot is upright and rises towards 0
+        as it tips onto its side.
 
         """
         quat = self._read_data("base_rot")
-        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        g = torch.tensor([0.0, 0.0, -1.0], device=self._device).expand(quat.shape[0], 3)
+        return self._quat_rotate_inverse(quat, g)
 
-        # Third row of the transpose of the rotation matrix, applied to
-        # (0, 0, -1). Equivalent to R^T @ g_world with |g| = 1.
-        return torch.stack(
-            [
-                -2.0 * (x * z - w * y),
-                -2.0 * (y * z + w * x),
-                -(1.0 - 2.0 * (x * x + y * y)),
-            ],
-            dim=-1,
+    def _heading(self):
+        """Yaw angle of the base forward axis, in radians. (num_envs,)"""
+        quat = self._read_data("base_rot")
+        fwd = torch.tensor([1.0, 0.0, 0.0], device=self._device).expand(
+            quat.shape[0], 3
         )
-
-    def _base_lin_vel(self):
-        """Linear velocity of the base, in the base frame. (num_envs, 3)"""
-        return self._read_data("base_vel_local")[:, 3:]
-
-    def _base_ang_vel(self):
-        """Angular velocity of the base, in the base frame. (num_envs, 3)"""
-        return self._read_data("base_vel_local")[:, :3]
+        fwd = self._quat_rotate(quat, fwd)
+        return torch.atan2(fwd[:, 1], fwd[:, 0])
 
     def _joint_pos(self):
         return wp.to_torch(self._data_wp.qpos)[:, 7:]
@@ -287,6 +324,10 @@ class Go2Base(MuJoCoWarp):
 
     def _joint_torque(self):
         return wp.to_torch(self._data_wp.ctrl)
+
+    def _foot_height(self):
+        """Height of each foot geom centre above the ground. (num_envs, 4)"""
+        return wp.to_torch(self._data_wp.geom_xpos)[:, self._feet_geom_ids, 2]
 
     # ------------------------------------------------------------------
     # Health / termination
@@ -311,13 +352,15 @@ class Go2Base(MuJoCoWarp):
         )
 
     # ------------------------------------------------------------------
-    # Reset
+    # Reset and domain randomisation
     # ------------------------------------------------------------------
 
     def setup(self, env_indices, obs):
         """
-        Reset the given environments to the default standing pose with a small
-        amount of joint noise.
+        Reset the given environments to the default standing pose. With domain
+        randomisation the joint angles are scaled by a random factor in
+        [0.5, 1.5] and the base is given a random initial velocity, as in the
+        A1Walking reference.
 
         """
         super().setup(env_indices, obs)
@@ -339,12 +382,35 @@ class Go2Base(MuJoCoWarp):
         qpos[idx] = self._default_qpos
         qvel[idx] = 0.0
 
-        noise = (
-            torch.rand(n, self._n_joints, device=qpos.device) * 2 - 1
-        ) * self._reset_noise_scale
-        qpos[idx, 7:] += noise
+        if self._domain_randomization:
+            factors = torch.rand(n, self._n_joints, device=qpos.device) + 0.5
+            qpos[idx, 7:] = self._default_joint_pos * factors
+            qvel[idx, :6] = torch.rand(n, 6, device=qpos.device) - 0.5
+
+        self._actions[idx] = 0.0
+        self._episode_length[idx] = 0
 
         self._mj_warp.forward(self._model_wp, self._data_wp)
+
+    def _step_finalize(self):
+        self._episode_length += 1
+
+        if self._domain_randomization:
+            do_push = (
+                torch.rand(self.number, device=self._device) < 1.0 / self._push_interval
+            )
+            do_push &= self._episode_length > 50
+            self._push_robots(torch.nonzero(do_push, as_tuple=True)[0])
+
+    def _push_robots(self, env_indices):
+        """Overwrite the base planar velocity of the given environments."""
+        if len(env_indices) == 0:
+            return
+        qvel = wp.to_torch(self._data_wp.qvel)
+        vel = (
+            torch.rand(len(env_indices), 2, device=self._device) * 2 - 1
+        ) * self._push_max_vel
+        qvel[env_indices, 0:2] = vel
 
     def get_states(self):
         qpos = wp.to_torch(self._data_wp.qpos)

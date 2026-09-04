@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from mushroom_rl.core.spaces import Box
@@ -9,16 +10,16 @@ class Go2Walk(Go2Base):
     """
     Velocity tracking task for the Unitree Go2.
 
-    Each episode samples a target base velocity (forward, lateral, yaw rate)
-    and the policy is rewarded for tracking it while keeping the motion
-    smooth and within joint limits. This is the standard legged locomotion
-    formulation used by legged_gym and unitree_rl_gym, with the terms that
-    require contact information (feet air time, collision penalties) left
-    out until batched contact queries are available.
+    Resembles the IsaacSim A1Walking environment and Rudin et al., "Learning
+    to Walk in Minutes Using Massively Parallel Deep Reinforcement Learning".
 
-    Note that the weights below are per environment step, whereas legged_gym
-    scales its reward terms by dt. Their published values are therefore not
-    directly comparable; the ratios between terms are what carries over.
+    Each environment tracks a commanded planar velocity and heading. The
+    reward is the Rudin formulation with every term scaled by dt and the total
+    clamped at zero, so that surviving is never worse than terminating. The
+    two terms that need contact forces in the reference are handled as
+    follows: feet air time uses a foot height proxy for ground contact, and
+    the collision penalty is omitted until batched contact queries are
+    available in the warp backend.
 
     """
 
@@ -26,19 +27,22 @@ class Go2Walk(Go2Base):
         self,
         num_envs,
         lin_vel_x_range=(-1.0, 1.0),
-        lin_vel_y_range=(-0.5, 0.5),
-        ang_vel_yaw_range=(-1.0, 1.0),
+        lin_vel_y_range=(-1.0, 1.0),
+        heading_range=(-np.pi, np.pi),
         command_deadband=0.2,
+        command_resample_interval=500,
         tracking_sigma=0.25,
+        foot_contact_height=0.03,
         tracking_lin_vel_weight=1.0,
         tracking_ang_vel_weight=0.5,
         lin_vel_z_weight=2.0,
         ang_vel_xy_weight=0.05,
-        orientation_weight=0.0,
         torque_weight=2e-4,
         joint_acc_weight=2.5e-7,
+        feet_air_time_weight=1.0,
         action_rate_weight=0.01,
         joint_limit_weight=10.0,
+        obs_noise=True,
         **kwargs,
     ):
         """
@@ -49,66 +53,167 @@ class Go2Walk(Go2Base):
                 command, in m/s;
             lin_vel_y_range (tuple): sampling range of the lateral velocity
                 command, in m/s;
-            ang_vel_yaw_range (tuple): sampling range of the yaw rate command,
-                in rad/s;
-            command_deadband (float): commands with norm below this value are
-                set to zero, so the robot also learns to stand still;
+            heading_range (tuple): sampling range of the target heading, in
+                radians. The yaw rate command is derived from the heading
+                error each step;
+            command_deadband (float): commands with planar norm below this
+                value are set to zero, so the robot also learns to stand;
+            command_resample_interval (int): mean number of steps between
+                command resamples within an episode;
             tracking_sigma (float): width of the exponential tracking kernel;
-            *_weight (float): weights of the reward terms. Penalty weights are
-                positive and subtracted.
+            foot_contact_height (float): foot centre height below which the
+                foot is considered in contact with the ground. The foot geoms
+                are spheres of radius 0.022;
+            *_weight (float): weights of the reward terms, per second. Every
+                term is multiplied by dt;
+            obs_noise (bool): whether to add uniform noise to the observation.
 
         """
         self._lin_vel_x_range = lin_vel_x_range
         self._lin_vel_y_range = lin_vel_y_range
-        self._ang_vel_yaw_range = ang_vel_yaw_range
+        self._heading_range = heading_range
         self._command_deadband = command_deadband
+        self._command_resample_interval = command_resample_interval
         self._tracking_sigma = tracking_sigma
+        self._foot_contact_height = foot_contact_height
+        self._obs_noise = obs_noise
 
         self._w_tracking_lin = tracking_lin_vel_weight
         self._w_tracking_ang = tracking_ang_vel_weight
         self._w_lin_vel_z = lin_vel_z_weight
         self._w_ang_vel_xy = ang_vel_xy_weight
-        self._w_orientation = orientation_weight
         self._w_torque = torque_weight
         self._w_joint_acc = joint_acc_weight
+        self._w_feet_air_time = feet_air_time_weight
         self._w_action_rate = action_rate_weight
         self._w_joint_limit = joint_limit_weight
 
         super().__init__(num_envs, **kwargs)
+        dev = self._device
 
-        # Per environment task state. Commands are resampled on reset; the
-        # previous action and joint velocity are needed for rate penalties.
-        self._commands = torch.zeros(num_envs, 3, device=self._device)
-        self._prev_action = torch.zeros(num_envs, self._n_joints, device=self._device)
-        self._prev_joint_vel = torch.zeros(
-            num_envs, self._n_joints, device=self._device
-        )
+        # Commands: [vx, vy, yaw_rate, heading]. The yaw rate is recomputed
+        # from the heading error every step rather than sampled directly.
+        self._commands = torch.zeros(num_envs, 4, device=dev)
+
+        self._last_actions = torch.zeros(num_envs, self._n_joints, device=dev)
+        self._last_joint_vel = torch.zeros(num_envs, self._n_joints, device=dev)
+        self._feet_air_time = torch.zeros(num_envs, 4, device=dev)
+        self._last_contacts = torch.zeros(num_envs, 4, dtype=torch.bool, device=dev)
+
+        self._normalization_vec = self._get_obs_normalization_vec()
+        self._noise_scale_vec = self._get_noise_scale_vec()
+
+        # Observation space after default shift, scaling and noise.
+        obs_low, obs_high = self.obs_helper.get_obs_limits()
+        obs_low = torch.as_tensor(obs_low, dtype=torch.float32, device=dev).clone()
+        obs_high = torch.as_tensor(obs_high, dtype=torch.float32, device=dev).clone()
+        obs_low[self._joint_pos_slice] -= self._default_joint_pos
+        obs_high[self._joint_pos_slice] -= self._default_joint_pos
+        obs_low = obs_low * self._normalization_vec - self._noise_scale_vec
+        obs_high = obs_high * self._normalization_vec + self._noise_scale_vec
+        self.info.observation_space = Box(obs_low, obs_high)
+
+        zero = torch.zeros(num_envs, device=dev)
+        self._reward_info = {k: zero for k in self._REWARD_KEYS}
+
+    _REWARD_KEYS = (
+        "tracking_lin_vel",
+        "tracking_ang_vel",
+        "lin_vel_z",
+        "ang_vel_xy",
+        "torques",
+        "joint_acc",
+        "feet_air_time",
+        "action_rate",
+        "joint_pos_limits",
+    )
 
     # ------------------------------------------------------------------
-    # Observation
+    # Observation layout
     # ------------------------------------------------------------------
 
     def _modify_mdp_info(self, mdp_info):
         mdp_info = super()._modify_mdp_info(mdp_info)
         # Appended in _create_observation, in this order.
-        self.obs_helper.add_obs("command", 3)
         self.obs_helper.add_obs("projected_gravity", 3, -1.0, 1.0)
-        self.obs_helper.add_obs("prev_action", self._n_joints)
+        self.obs_helper.add_obs("commands", 3, -1.0, 1.0)
+        self.obs_helper.add_obs(
+            "actions",
+            self._n_joints,
+            self.info.action_space.low,
+            self.info.action_space.high,
+        )
         mdp_info.observation_space = Box(*self.obs_helper.get_obs_limits())
         return mdp_info
 
+    def _get_obs_normalization_vec(self):
+        v = torch.ones(self.obs_helper.obs_low.shape[0], device=self._device)
+        v[self._lin_vel_slice] = 2.0
+        v[self._ang_vel_slice] = 0.25
+        v[self._joint_pos_slice] = 1.0
+        v[self._joint_vel_slice] = 0.05
+        v[self.obs_helper.obs_idx_map["projected_gravity"]] = 1.0
+        cmd = self.obs_helper.obs_idx_map["commands"]
+        v[cmd[0:2]] = 2.0
+        v[cmd[2]] = 0.25
+        v[self.obs_helper.obs_idx_map["actions"]] = 1.0
+        return v
+
+    def _get_noise_scale_vec(self):
+        v = torch.zeros(self.obs_helper.obs_low.shape[0], device=self._device)
+        if not self._obs_noise:
+            return v
+        v[self._lin_vel_slice] = 0.1 * 2.0
+        v[self._ang_vel_slice] = 0.2 * 0.25
+        v[self._joint_pos_slice] = 0.01 * 1.0
+        v[self._joint_vel_slice] = 1.5 * 0.05
+        v[self.obs_helper.obs_idx_map["projected_gravity"]] = 0.05
+        return v
+
     def _create_observation(self, obs):
-        obs = obs.clone()
-        # Joint positions relative to the default pose, so that the standing
-        # configuration reads as zero regardless of the absolute angles.
-        obs[:, self._joint_pos_slice] -= self._default_joint_pos
+        # Fill in the observations that are not read from the simulation.
+        # Joint positions are kept absolute here because reward() reads them
+        # for the limit penalty; the default offset is applied in
+        # _modify_observation, after the reward has been computed.
         return torch.cat(
-            [obs, self._commands, self._projected_gravity(), self._prev_action],
+            [obs, self._projected_gravity(), self._commands[:, :3], self._actions],
             dim=1,
         )
 
+    def _modify_observation(self, obs):
+        obs = obs.clone()
+        obs[:, self._joint_pos_slice] -= self._default_joint_pos
+        obs *= self._normalization_vec
+        if self._obs_noise:
+            obs += (2.0 * torch.rand_like(obs) - 1.0) * self._noise_scale_vec
+        return torch.clamp(obs, min=-100.0, max=100.0)
+
     # ------------------------------------------------------------------
-    # Reset
+    # Commands
+    # ------------------------------------------------------------------
+
+    def _resample_commands(self, env_indices):
+        n = len(env_indices)
+        if n == 0:
+            return
+
+        def uniform(lo, hi):
+            return torch.rand(n, device=self._device) * (hi - lo) + lo
+
+        self._commands[env_indices, 0] = uniform(*self._lin_vel_x_range)
+        self._commands[env_indices, 1] = uniform(*self._lin_vel_y_range)
+        self._commands[env_indices, 3] = uniform(*self._heading_range)
+
+        # Small commands are zeroed so the policy also learns to stand still.
+        small = self._commands[env_indices, :2].norm(dim=1) < self._command_deadband
+        self._commands[env_indices[small], :2] = 0.0
+
+    def _update_yaw_command(self):
+        heading_error = self._wrap_to_pi(self._commands[:, 3] - self._heading())
+        self._commands[:, 2] = torch.clamp(0.5 * heading_error, -1.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Reset and step bookkeeping
     # ------------------------------------------------------------------
 
     def setup(self, env_indices, obs):
@@ -119,104 +224,126 @@ class Go2Walk(Go2Base):
             if isinstance(env_indices, torch.Tensor)
             else torch.as_tensor(env_indices, device=self._device, dtype=torch.long)
         )
-        n = len(idx)
-        if n == 0:
+        if len(idx) == 0:
             return
 
-        self._commands[idx] = self._sample_commands(n)
-        self._prev_action[idx] = 0.0
-        self._prev_joint_vel[idx] = 0.0
+        self._last_actions[idx] = 0.0
+        self._last_joint_vel[idx] = self._joint_vel()[idx]
+        self._feet_air_time[idx] = 0.0
+        self._last_contacts[idx] = False
 
-    def _sample_commands(self, n):
-        def uniform(lo, hi):
-            return torch.rand(n, device=self._device) * (hi - lo) + lo
+        self._resample_commands(idx)
+        self._update_yaw_command()
 
-        cmd = torch.stack(
-            [
-                uniform(*self._lin_vel_x_range),
-                uniform(*self._lin_vel_y_range),
-                uniform(*self._ang_vel_yaw_range),
-            ],
-            dim=1,
+    def _step_finalize(self):
+        super()._step_finalize()
+
+        do_resample = (
+            torch.rand(self.number, device=self._device)
+            < 1.0 / self._command_resample_interval
         )
-        # Small commands are zeroed so the policy also learns to stand still
-        # rather than jittering in place chasing tiny targets.
-        small = cmd[:, :2].norm(dim=1) < self._command_deadband
-        cmd[small] = 0.0
-        return cmd
+        do_resample &= self._episode_length > 50
+        self._resample_commands(torch.nonzero(do_resample, as_tuple=True)[0])
 
-    # ------------------------------------------------------------------
-    # Step bookkeeping
-    # ------------------------------------------------------------------
-
-    def _step_init(self, obs, action):
-        # Joint velocity before the step, for the acceleration penalty.
-        self._prev_joint_vel = self._joint_vel().clone()
+        self._update_yaw_command()
 
     # ------------------------------------------------------------------
     # Reward
     # ------------------------------------------------------------------
 
-    def _reward_terms(self, action):
-        """
-        Compute every reward component, unweighted, as a dict of (num_envs,)
-        tensors. Kept separate from reward() so the same values can be
-        reported through _create_info_dictionary.
-
-        """
-        lin_vel = self._base_lin_vel()
-        ang_vel = self._base_ang_vel()
-        gravity = self._projected_gravity()
+    def reward(self, obs, action, next_obs, absorbing):
+        lin_vel = next_obs[:, self._lin_vel_slice]
+        ang_vel = next_obs[:, self._ang_vel_slice]
         joint_pos = self._joint_pos()
         joint_vel = self._joint_vel()
         torque = self._joint_torque()
+        dt = self.dt
 
-        cmd = self._commands
-
-        lin_err = ((cmd[:, :2] - lin_vel[:, :2]) ** 2).sum(dim=1)
-        ang_err = (cmd[:, 2] - ang_vel[:, 2]) ** 2
-
-        joint_acc = (joint_vel - self._prev_joint_vel) / self.dt
-
-        below = torch.clamp(self._joint_lower - joint_pos, min=0.0)
-        above = torch.clamp(joint_pos - self._joint_upper, min=0.0)
-
-        return {
-            "tracking_lin_vel": torch.exp(-lin_err / self._tracking_sigma),
-            "tracking_ang_vel": torch.exp(-ang_err / self._tracking_sigma),
-            "lin_vel_z": lin_vel[:, 2] ** 2,
-            "ang_vel_xy": (ang_vel[:, :2] ** 2).sum(dim=1),
-            "orientation": (gravity[:, :2] ** 2).sum(dim=1),
-            "torque": (torque**2).sum(dim=1),
-            "joint_acc": (joint_acc**2).sum(dim=1),
-            "action_rate": ((action - self._prev_action) ** 2).sum(dim=1),
-            "joint_limit": (below + above).sum(dim=1),
+        r = {
+            "tracking_lin_vel": self._reward_tracking_lin_vel(lin_vel[:, :2])
+            * self._w_tracking_lin
+            * dt,
+            "tracking_ang_vel": self._reward_tracking_ang_vel(ang_vel[:, 2])
+            * self._w_tracking_ang
+            * dt,
+            "lin_vel_z": self._reward_lin_vel_z(lin_vel[:, 2])
+            * -self._w_lin_vel_z
+            * dt,
+            "ang_vel_xy": self._reward_ang_vel_xy(ang_vel[:, :2])
+            * -self._w_ang_vel_xy
+            * dt,
+            "torques": self._reward_torques(torque) * -self._w_torque * dt,
+            "joint_acc": self._reward_joint_acc(joint_vel) * -self._w_joint_acc * dt,
+            "feet_air_time": self._reward_feet_air_time() * self._w_feet_air_time * dt,
+            "action_rate": self._reward_action_rate(action) * -self._w_action_rate * dt,
+            "joint_pos_limits": self._reward_joint_pos_limits(joint_pos)
+            * -self._w_joint_limit
+            * dt,
         }
+        self._reward_info = r
 
-    def reward(self, obs, action, next_obs, absorbing):
-        t = self._reward_terms(action)
+        total = sum(r.values())
+        total = torch.clamp(total, min=0.0)
 
-        r = (
-            self._w_tracking_lin * t["tracking_lin_vel"]
-            + self._w_tracking_ang * t["tracking_ang_vel"]
-            - self._w_lin_vel_z * t["lin_vel_z"]
-            - self._w_ang_vel_xy * t["ang_vel_xy"]
-            - self._w_orientation * t["orientation"]
-            - self._w_torque * t["torque"]
-            - self._w_joint_acc * t["joint_acc"]
-            - self._w_action_rate * t["action_rate"]
-            - self._w_joint_limit * t["joint_limit"]
-        )
+        self._last_actions = action.clone()
+        self._last_joint_vel = joint_vel.clone()
 
-        self._prev_action = action.clone()
-        return r
+        return total
+
+    def _reward_tracking_lin_vel(self, lin_vel_xy):
+        err = ((self._commands[:, :2] - lin_vel_xy) ** 2).sum(dim=1)
+        return torch.exp(-err / self._tracking_sigma)
+
+    def _reward_tracking_ang_vel(self, ang_vel_z):
+        err = (self._commands[:, 2] - ang_vel_z) ** 2
+        return torch.exp(-err / self._tracking_sigma)
+
+    @staticmethod
+    def _reward_lin_vel_z(lin_vel_z):
+        return lin_vel_z**2
+
+    @staticmethod
+    def _reward_ang_vel_xy(ang_vel_xy):
+        return (ang_vel_xy**2).sum(dim=1)
+
+    @staticmethod
+    def _reward_torques(torque):
+        return (torque**2).sum(dim=1)
+
+    def _reward_joint_acc(self, joint_vel):
+        return (((self._last_joint_vel - joint_vel) / self.dt) ** 2).sum(dim=1)
+
+    def _reward_action_rate(self, action):
+        return ((self._last_actions - action) ** 2).sum(dim=1)
+
+    def _reward_joint_pos_limits(self, joint_pos):
+        below = torch.clamp(self._soft_joint_lower - joint_pos, min=0.0)
+        above = torch.clamp(joint_pos - self._soft_joint_upper, min=0.0)
+        return (below + above).sum(dim=1)
+
+    def _reward_feet_air_time(self):
+        """
+        Reward long steps: on the first contact after a swing, pay out the
+        swing duration minus 0.5 s. Contact is detected from foot height, as
+        the warp backend does not expose contact forces per body.
+
+        """
+        contact = self._foot_height() < self._foot_contact_height
+        contact_filt = contact | self._last_contacts
+        self._last_contacts = contact
+        first_contact = (self._feet_air_time > 0.0) & contact_filt
+        self._feet_air_time += self.dt
+        rew = ((self._feet_air_time - 0.5) * first_contact).sum(dim=1)
+        rew *= self._commands[:, :2].norm(dim=1) > 0.1
+        self._feet_air_time *= ~contact_filt
+        return rew
 
     def is_absorbing(self, obs):
         return self._terminate_when_unhealthy & ~self._is_healthy(obs)
 
     def _create_info_dictionary(self, obs):
-        t = self._reward_terms(self._prev_action)
-        t["command_x"] = self._commands[:, 0]
-        t["command_y"] = self._commands[:, 1]
-        t["command_yaw"] = self._commands[:, 2]
-        return t
+        info = dict(self._reward_info)
+        info["command_x"] = self._commands[:, 0]
+        info["command_y"] = self._commands[:, 1]
+        info["command_yaw"] = self._commands[:, 2]
+        return info
