@@ -23,6 +23,18 @@ class Go2Walk(Go2Base):
 
     """
 
+    _REWARD_KEYS = (
+        "tracking_lin_vel",
+        "tracking_ang_vel",
+        "lin_vel_z",
+        "ang_vel_xy",
+        "torques",
+        "joint_acc",
+        "feet_air_time",
+        "action_rate",
+        "joint_pos_limits",
+    )
+
     def __init__(
         self,
         num_envs,
@@ -89,21 +101,46 @@ class Go2Walk(Go2Base):
         self._w_joint_limit = joint_limit_weight
 
         super().__init__(num_envs, **kwargs)
+
+        zero = torch.zeros(num_envs, device=self._device)
+        self._reward_info = {k: zero for k in self._REWARD_KEYS}
+
+    # ------------------------------------------------------------------
+    # Observation layout
+    # ------------------------------------------------------------------
+
+    def _modify_mdp_info(self, mdp_info):
+        # Sets device, default pose, slices and the action space.
+        mdp_info = super()._modify_mdp_info(mdp_info)
         dev = self._device
 
-        # Commands: [vx, vy, yaw_rate, heading]. The yaw rate is recomputed
+        # Task state. Allocated here rather than after super().__init__()
+        # because _create_observation may run before the constructor returns.
+        # Commands are [vx, vy, yaw_rate, heading]; the yaw rate is recomputed
         # from the heading error every step rather than sampled directly.
-        self._commands = torch.zeros(num_envs, 4, device=dev)
+        self._commands = torch.zeros(self._num_envs, 4, device=dev)
+        self._last_actions = torch.zeros(self._num_envs, self._n_joints, device=dev)
+        self._last_joint_vel = torch.zeros(self._num_envs, self._n_joints, device=dev)
+        self._feet_air_time = torch.zeros(self._num_envs, 4, device=dev)
+        self._last_contacts = torch.zeros(
+            self._num_envs, 4, dtype=torch.bool, device=dev
+        )
 
-        self._last_actions = torch.zeros(num_envs, self._n_joints, device=dev)
-        self._last_joint_vel = torch.zeros(num_envs, self._n_joints, device=dev)
-        self._feet_air_time = torch.zeros(num_envs, 4, device=dev)
-        self._last_contacts = torch.zeros(num_envs, 4, dtype=torch.bool, device=dev)
+        # Appended in _create_observation, in this order.
+        self.obs_helper.add_obs("projected_gravity", 3, -1.0, 1.0)
+        self.obs_helper.add_obs("commands", 3, -1.0, 1.0)
+        self.obs_helper.add_obs(
+            "actions",
+            self._n_joints,
+            mdp_info.action_space.low,
+            mdp_info.action_space.high,
+        )
 
         self._normalization_vec = self._get_obs_normalization_vec()
         self._noise_scale_vec = self._get_noise_scale_vec()
 
-        # Observation space after default shift, scaling and noise.
+        # Observation space after the default pose shift, the fixed scaling
+        # and the observation noise, matching what the policy actually sees.
         obs_low, obs_high = self.obs_helper.get_obs_limits()
         obs_low = torch.as_tensor(obs_low, dtype=torch.float32, device=dev).clone()
         obs_high = torch.as_tensor(obs_high, dtype=torch.float32, device=dev).clone()
@@ -111,39 +148,8 @@ class Go2Walk(Go2Base):
         obs_high[self._joint_pos_slice] -= self._default_joint_pos
         obs_low = obs_low * self._normalization_vec - self._noise_scale_vec
         obs_high = obs_high * self._normalization_vec + self._noise_scale_vec
-        self.info.observation_space = Box(obs_low, obs_high)
+        mdp_info.observation_space = Box(obs_low, obs_high)
 
-        zero = torch.zeros(num_envs, device=dev)
-        self._reward_info = {k: zero for k in self._REWARD_KEYS}
-
-    _REWARD_KEYS = (
-        "tracking_lin_vel",
-        "tracking_ang_vel",
-        "lin_vel_z",
-        "ang_vel_xy",
-        "torques",
-        "joint_acc",
-        "feet_air_time",
-        "action_rate",
-        "joint_pos_limits",
-    )
-
-    # ------------------------------------------------------------------
-    # Observation layout
-    # ------------------------------------------------------------------
-
-    def _modify_mdp_info(self, mdp_info):
-        mdp_info = super()._modify_mdp_info(mdp_info)
-        # Appended in _create_observation, in this order.
-        self.obs_helper.add_obs("projected_gravity", 3, -1.0, 1.0)
-        self.obs_helper.add_obs("commands", 3, -1.0, 1.0)
-        self.obs_helper.add_obs(
-            "actions",
-            self._n_joints,
-            self.info.action_space.low,
-            self.info.action_space.high,
-        )
-        mdp_info.observation_space = Box(*self.obs_helper.get_obs_limits())
         return mdp_info
 
     def _get_obs_normalization_vec(self):
@@ -239,7 +245,7 @@ class Go2Walk(Go2Base):
         super()._step_finalize()
 
         do_resample = (
-            torch.rand(self.number, device=self._device)
+            torch.rand(self._num_envs, device=self._device)
             < 1.0 / self._command_resample_interval
         )
         do_resample &= self._episode_length > 50
@@ -282,8 +288,7 @@ class Go2Walk(Go2Base):
         }
         self._reward_info = r
 
-        total = sum(r.values())
-        total = torch.clamp(total, min=0.0)
+        total = torch.clamp(sum(r.values()), min=0.0)
 
         self._last_actions = action.clone()
         self._last_joint_vel = joint_vel.clone()

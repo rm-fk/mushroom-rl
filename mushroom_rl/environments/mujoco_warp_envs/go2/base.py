@@ -1,6 +1,5 @@
 import os
 
-import numpy as np
 import torch
 import warp as wp
 
@@ -23,6 +22,13 @@ class Go2Base(MuJoCoWarp):
     turn resembles Rudin et al., "Learning to Walk in Minutes Using Massively
     Parallel Deep Reinforcement Learning". Task classes derive from this and
     supply reward, is_absorbing and the task specific observations.
+
+    Note on construction order: the parent constructor calls
+    _modify_mdp_info before it calls Environment.__init__, so self.info does
+    not exist yet at that point. Everything that depends on the loaded model
+    is therefore set up inside _modify_mdp_info, which does have access to
+    _model, _model_wp, _data_wp and obs_helper, and the spaces are written to
+    the mdp_info argument rather than to self.info.
 
     """
 
@@ -150,9 +156,10 @@ class Go2Base(MuJoCoWarp):
         self._domain_randomization = domain_randomization
         self._push_interval = push_interval
         self._push_max_vel = push_max_vel
+        self._num_envs = num_envs
 
         # Must precede super().__init__(): the parent calls _modify_mdp_info
-        # partway through its own constructor, and subclasses use this there.
+        # partway through its own constructor, and it uses this.
         self._n_joints = len(self.LEG_JOINTS)
 
         super().__init__(
@@ -171,8 +178,13 @@ class Go2Base(MuJoCoWarp):
             **viewer_params,
         )
 
-        self._device = wp.to_torch(self._data_wp.qpos).device
-        dev = self._device
+    # ------------------------------------------------------------------
+    # MDP info / model dependent setup
+    # ------------------------------------------------------------------
+
+    def _modify_mdp_info(self, mdp_info):
+        dev = wp.to_torch(self._data_wp.qpos).device
+        self._device = dev
 
         # Nominal standing pose, taken from the "home" keyframe of the MJCF.
         # qpos0 has the legs fully extended and the base at 0.445, which is
@@ -194,7 +206,7 @@ class Go2Base(MuJoCoWarp):
         self._joint_lower = rng[:, 0]
         self._joint_upper = rng[:, 1]
         mid = 0.5 * (rng[:, 0] + rng[:, 1])
-        half = 0.5 * (rng[:, 1] - rng[:, 0]) * soft_joint_limit
+        half = 0.5 * (rng[:, 1] - rng[:, 0]) * self._soft_joint_limit
         self._soft_joint_lower = mid - half
         self._soft_joint_upper = mid + half
 
@@ -207,22 +219,10 @@ class Go2Base(MuJoCoWarp):
             [self._model.geom(g).id for g in self.FEET_GEOMS], device=dev
         )
 
-        # The action is a joint position offset scaled by action_scale, so
-        # the action space is the joint range expressed in those units.
-        low = (self._joint_lower - self._default_joint_pos) / action_scale
-        high = (self._joint_upper - self._default_joint_pos) / action_scale
-        self.info.action_space = Box(low, high)
+        self._actions = torch.zeros(self._num_envs, self._n_joints, device=dev)
+        self._episode_length = torch.zeros(self._num_envs, dtype=torch.long, device=dev)
 
-        self._actions = torch.zeros(num_envs, self._n_joints, device=dev)
-        self._episode_length = torch.zeros(num_envs, dtype=torch.long, device=dev)
-
-    # ------------------------------------------------------------------
-    # MDP info / observation layout
-    # ------------------------------------------------------------------
-
-    def _modify_mdp_info(self, mdp_info):
-        # Contiguous slices of the joint positions and velocities in the
-        # observation, for use by subclasses.
+        # Contiguous slices of the observation, for use by subclasses.
         first_pos = self.obs_helper.obs_idx_map[f"{self.LEG_JOINTS[0]}_pos"][0]
         last_pos = self.obs_helper.obs_idx_map[f"{self.LEG_JOINTS[-1]}_pos"][-1]
         first_vel = self.obs_helper.obs_idx_map[f"{self.LEG_JOINTS[0]}_vel"][0]
@@ -234,6 +234,14 @@ class Go2Base(MuJoCoWarp):
         base_vel = self.obs_helper.obs_idx_map["base_vel"]
         self._ang_vel_slice = slice(base_vel[0], base_vel[0] + 3)
         self._lin_vel_slice = slice(base_vel[0] + 3, base_vel[0] + 6)
+
+        # The action is a joint position offset scaled by action_scale, so
+        # the action space is the joint range expressed in those units. The
+        # space computed by the parent is the raw torque range, which is not
+        # what the policy outputs.
+        low = (self._joint_lower - self._default_joint_pos) / self._action_scale
+        high = (self._joint_upper - self._default_joint_pos) / self._action_scale
+        mdp_info.action_space = Box(low, high)
 
         mdp_info = super()._modify_mdp_info(mdp_info)
         mdp_info.observation_space = Box(*self.obs_helper.get_obs_limits())
@@ -397,7 +405,8 @@ class Go2Base(MuJoCoWarp):
 
         if self._domain_randomization:
             do_push = (
-                torch.rand(self.number, device=self._device) < 1.0 / self._push_interval
+                torch.rand(self._num_envs, device=self._device)
+                < 1.0 / self._push_interval
             )
             do_push &= self._episode_length > 50
             self._push_robots(torch.nonzero(do_push, as_tuple=True)[0])
