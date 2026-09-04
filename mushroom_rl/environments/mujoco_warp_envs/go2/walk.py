@@ -126,7 +126,8 @@ class Go2Walk(Go2Base):
             self._num_envs, 4, dtype=torch.bool, device=dev
         )
 
-        # Appended in _create_observation, in this order.
+        # Appended in _create_observation, in this order. Bounds are numpy,
+        # as the observation helper requires.
         self.obs_helper.add_obs("projected_gravity", 3, -1.0, 1.0)
         self.obs_helper.add_obs("commands", 3, -1.0, 1.0)
         self.obs_helper.add_obs(
@@ -136,24 +137,32 @@ class Go2Walk(Go2Base):
             mdp_info.action_space.high,
         )
 
-        self._normalization_vec = self._get_obs_normalization_vec()
-        self._noise_scale_vec = self._get_noise_scale_vec()
+        norm_np = self._get_obs_normalization_vec()
+        noise_np = self._get_noise_scale_vec()
+        self._normalization_vec = torch.as_tensor(
+            norm_np, dtype=torch.float32, device=dev
+        )
+        self._noise_scale_vec = torch.as_tensor(
+            noise_np, dtype=torch.float32, device=dev
+        )
 
         # Observation space after the default pose shift, the fixed scaling
         # and the observation noise, matching what the policy actually sees.
+        # get_obs_limits returns the helper's own arrays; copy before editing.
         obs_low, obs_high = self.obs_helper.get_obs_limits()
-        obs_low = torch.as_tensor(obs_low, dtype=torch.float32, device=dev).clone()
-        obs_high = torch.as_tensor(obs_high, dtype=torch.float32, device=dev).clone()
-        obs_low[self._joint_pos_slice] -= self._default_joint_pos
-        obs_high[self._joint_pos_slice] -= self._default_joint_pos
-        obs_low = obs_low * self._normalization_vec - self._noise_scale_vec
-        obs_high = obs_high * self._normalization_vec + self._noise_scale_vec
+        obs_low = obs_low.astype(np.float64, copy=True)
+        obs_high = obs_high.astype(np.float64, copy=True)
+        default_joint_np = self._model.key_qpos[0][7:]
+        obs_low[self._joint_pos_slice] -= default_joint_np
+        obs_high[self._joint_pos_slice] -= default_joint_np
+        obs_low = obs_low * norm_np - noise_np
+        obs_high = obs_high * norm_np + noise_np
         mdp_info.observation_space = Box(obs_low, obs_high)
 
         return mdp_info
 
     def _get_obs_normalization_vec(self):
-        v = torch.ones(self.obs_helper.obs_low.shape[0], device=self._device)
+        v = np.ones(self.obs_helper.obs_low.shape[0])
         v[self._lin_vel_slice] = 2.0
         v[self._ang_vel_slice] = 0.25
         v[self._joint_pos_slice] = 1.0
@@ -166,7 +175,7 @@ class Go2Walk(Go2Base):
         return v
 
     def _get_noise_scale_vec(self):
-        v = torch.zeros(self.obs_helper.obs_low.shape[0], device=self._device)
+        v = np.zeros(self.obs_helper.obs_low.shape[0])
         if not self._obs_noise:
             return v
         v[self._lin_vel_slice] = 0.1 * 2.0

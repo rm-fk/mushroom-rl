@@ -238,10 +238,14 @@ class Go2Base(MuJoCoWarp):
         # The action is a joint position offset scaled by action_scale, so
         # the action space is the joint range expressed in those units. The
         # space computed by the parent is the raw torque range, which is not
-        # what the policy outputs.
-        low = (self._joint_lower - self._default_joint_pos) / self._action_scale
-        high = (self._joint_upper - self._default_joint_pos) / self._action_scale
-        mdp_info.action_space = Box(low, high)
+        # what the policy outputs. Spaces are numpy in this codebase (the
+        # observation helper is numpy-native); the torch copies above are for
+        # use at runtime.
+        default_joint_np = self._model.key_qpos[0][7:]
+        jnt_range_np = self._model.jnt_range[1:]
+        action_low = (jnt_range_np[:, 0] - default_joint_np) / self._action_scale
+        action_high = (jnt_range_np[:, 1] - default_joint_np) / self._action_scale
+        mdp_info.action_space = Box(action_low, action_high)
 
         mdp_info = super()._modify_mdp_info(mdp_info)
         mdp_info.observation_space = Box(*self.obs_helper.get_obs_limits())
