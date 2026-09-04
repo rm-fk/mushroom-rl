@@ -201,6 +201,10 @@ class Go2Walk(Go2Base):
         obs *= self._normalization_vec
         if self._obs_noise:
             obs += (2.0 * torch.rand_like(obs) - 1.0) * self._noise_scale_vec
+        # clamp bounds inf but passes NaN through; an environment whose
+        # simulation has diverged is terminated by _is_finite, but its
+        # observation still enters the dataset, so it must be finite.
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=100.0, neginf=-100.0)
         return torch.clamp(obs, min=-100.0, max=100.0)
 
     # ------------------------------------------------------------------
@@ -298,6 +302,10 @@ class Go2Walk(Go2Base):
         self._reward_info = r
 
         total = torch.clamp(sum(r.values()), min=0.0)
+        # A diverged simulation produces inf/NaN here through the velocity
+        # terms; that environment is terminated by _is_finite, and its reward
+        # must be finite so it does not poison the whole batch through GAE.
+        total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
 
         self._last_actions = action.clone()
         self._last_joint_vel = joint_vel.clone()
