@@ -1,8 +1,8 @@
 """
-This script shows how to train the Unitree Go2 velocity tracking task with RudinPPO in MuJoCo Warp.
+This script shows how to train the Unitree Go2 velocity tracking task with PPO in MuJoCo Warp.
 
-The configuration follows the IsaacSim A1 example and Rudin et al., "Learning to Walk in Minutes
-Using Massively Parallel Deep Reinforcement Learning".
+The environment and reward follow the IsaacSim A1 example and Rudin et al., "Learning to Walk
+in Minutes Using Massively Parallel Deep Reinforcement Learning".
 
 """
 
@@ -16,7 +16,7 @@ import torch.optim as optim
 from tqdm import trange
 
 from mushroom_rl.core import Core, Logger
-from mushroom_rl.algorithms.actor_critic import RudinPPO
+from mushroom_rl.algorithms.actor_critic import PPO
 from mushroom_rl.environments.mujoco_warp_envs import Go2Walk
 from mushroom_rl.policy import GaussianTorchPolicy
 from mushroom_rl.approximators.parametric.networks import ActorNetwork
@@ -45,10 +45,11 @@ def experiment(
     # MDP
     mdp = Go2Walk(num_envs=n_envs, use_graph_capture=use_graph_capture)
 
-    # Settings, from the A1 reference. The learning rates are initial values;
-    # RudinPPO adapts them to hold the policy KL near desired_kl.
-    actor_lr = 1e-3
-    critic_lr = 1e-3
+    # Settings. The A1 reference uses lr 1e-3, but relies on RudinPPO to adapt
+    # it from the policy KL divergence; with vanilla PPO the learning rate is
+    # fixed, so a smaller and more conservative value is used here.
+    actor_lr = 3e-4
+    critic_lr = 3e-4
     n_features = [512, 256, 128]
     n_minibatches = 16
     batch_size = n_steps_per_fit // n_minibatches
@@ -57,8 +58,6 @@ def experiment(
     lam = 0.95
     std_0 = 1.0
     ent_coeff = 0.01
-    desired_kl = 0.01
-    clip_grad_norm = 1.0
 
     # Logging
     wandb_kwargs = None
@@ -80,20 +79,18 @@ def experiment(
                 lam=lam,
                 std_0=std_0,
                 ent_coeff=ent_coeff,
-                desired_kl=desired_kl,
-                clip_grad_norm=clip_grad_norm,
                 graph_capture=use_graph_capture,
             ),
         )
 
     logger = Logger(
-        f"{RudinPPO.name()}_{mdp.name()}",
+        f"{PPO.name()}_{mdp.name()}",
         results_dir="./logs",
         seed=seed,
         wandb_kwargs=wandb_kwargs,
     )
     logger.log_experiment_info(
-        RudinPPO,
+        PPO,
         mdp,
         n_epochs=n_epochs,
         n_steps=n_steps,
@@ -122,7 +119,7 @@ def experiment(
         output_shape=(1,),
     )
 
-    agent = RudinPPO(
+    agent = PPO(
         mdp.info,
         policy,
         critic_params=critic_params,
@@ -132,8 +129,6 @@ def experiment(
         eps_ppo=eps,
         lam=lam,
         ent_coeff=ent_coeff,
-        desired_kl=desired_kl,
-        clip_grad_norm=clip_grad_norm,
     )
 
     # Algorithm. No StandardizationPreprocessor: the environment applies the
