@@ -85,8 +85,8 @@ class Go2Base(MuJoCoWarp):
         domain_randomization=True,
         push_interval=750,
         push_max_vel=1.0,
-        n_substeps=1,
-        n_intermediate_steps=10,
+        n_substeps=10,
+        n_intermediate_steps=1,
         use_graph_capture=False,
         nconmax=None,
         njmax=256,
@@ -266,29 +266,7 @@ class Go2Base(MuJoCoWarp):
         action = torch.as_tensor(action, dtype=torch.float32, device=self._device)
         action = torch.clamp(action, min=-100.0, max=100.0)
         self._actions[:] = action
-        return action
-
-    def _compute_action(self, obs, action):
-        """
-        Map a policy action to joint torques through a PD controller.
-
-        The action is a joint position offset relative to the default pose.
-        The MJCF ships plain torque actuators, so the position loop is closed
-        here rather than by MuJoCo. Overriding this method makes the base
-        class recompute the torques once per intermediate step.
-
-        Moving the PD loop into the MJCF as <position> actuators would run it
-        inside the solver and inside the captured graph, which removes
-        n_intermediate_steps Python calls per environment step. That is the
-        recommended upgrade before scaling to large num_envs.
-
-        """
-        joint_pos = self._joint_pos()
-        joint_vel = self._joint_vel()
-
-        target = self._default_joint_pos + self._action_scale * action
-        torque = self._kp * (target - joint_pos) - self._kd * joint_vel
-        return torch.clamp(torque, -self._effort_limit, self._effort_limit)
+        return self._default_joint_pos + self._action_scale * action
 
     # ------------------------------------------------------------------
     # Quaternion helpers (w, x, y, z), batched over environments
