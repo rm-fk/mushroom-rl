@@ -1,6 +1,6 @@
 from .locomotion import HopperWarp, Walker2DWarp, AntWarp, HalfCheetahWarp
 
-from go2 import Go2Base, Go2Walk
+from .go2 import Go2Base, Go2Walk
 
 Go2Base.register()
 Go2Walk.register()
