@@ -356,6 +356,11 @@ class Go2Walk(Go2Base):
         first_contact = (self._feet_air_time > 0.0) & contact_filt
         self._feet_air_time += self.dt
         rew = ((self._feet_air_time - 0.5) * first_contact).sum(dim=1)
+        # Contact is detected from foot height rather than contact force, so
+        # feet flicker in and out of "contact" and short steps fire this term
+        # far more often than they should. Clamp so a swing shorter than the
+        # 0.5 s reference cannot turn a reward term into a penalty.
+        rew = torch.clamp(rew, min=0.0)
         rew *= self._commands[:, :2].norm(dim=1) > 0.1
         self._feet_air_time *= ~contact_filt
         return rew

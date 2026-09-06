@@ -89,7 +89,7 @@ class Go2Base(MuJoCoWarp):
         n_intermediate_steps=10,
         use_graph_capture=False,
         nconmax=None,
-        njmax=None,
+        njmax=256,
         scene="scene_mjx.xml",
         **viewer_params,
     ):

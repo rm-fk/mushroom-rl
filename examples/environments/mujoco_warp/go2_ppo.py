@@ -143,7 +143,10 @@ def experiment(
         E = agent.policy.entropy().item()
         L = dataset.episodes_length.float().mean().item()
         V = agent._V(dataset.get_init_states()).mean().item()
-        logger.log_evaluation(epoch, J=J, R=R, entropy=E, mean_ep_len=L, V=V)
+        R_step = R / max(L, 1.0)
+        logger.log_evaluation(
+            epoch, J=J, R=R, entropy=E, mean_ep_len=L, V=V, R_per_step=R_step
+        )
         logger.log_best_agent(agent, J)
 
     # RUN
