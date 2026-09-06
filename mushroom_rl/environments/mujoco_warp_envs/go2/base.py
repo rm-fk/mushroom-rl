@@ -8,6 +8,8 @@ from mushroom_rl.environments.mujoco import ObservationType
 from mushroom_rl.environments.mujoco_envs import __file__ as path_robots
 from mushroom_rl.environments.mujoco_warp import MuJoCoWarp
 
+import numpy as np
+
 
 class Go2Base(MuJoCoWarp):
     """
@@ -211,8 +213,13 @@ class Go2Base(MuJoCoWarp):
         self._soft_joint_upper = mid + half
 
         # Torque limits from the actuator ctrlrange.
+        force_range = self._model.actuator_forcerange
+        if not self._model.actuator_forcelimited.all():
+            # Fall back to the ctrlrange magnitude only where a force limit
+            # is genuinely absent; Go2 declares ctrlrange in Nm on <motor>.
+            force_range = self._model.actuator_ctrlrange
         self._effort_limit = torch.as_tensor(
-            self._model.actuator_ctrlrange[:, 1], dtype=torch.float32, device=dev
+            np.abs(force_range).max(axis=1), dtype=torch.float32, device=dev
         )
 
         self._feet_geom_ids = torch.as_tensor(
@@ -395,9 +402,14 @@ class Go2Base(MuJoCoWarp):
         qvel[idx] = 0.0
 
         if self._domain_randomization:
-            factors = torch.rand(n, self._n_joints, device=qpos.device) + 0.5
-            qpos[idx, 7:] = self._default_joint_pos * factors
-            qvel[idx, :6] = torch.rand(n, 6, device=qpos.device) - 0.5
+            # Additive joint noise. Multiplicative scaling of the default pose
+            # pushes the calf outside its soft limits at both ends, because
+            # Go2's calf default sits near the edge of its range.
+            noise = (torch.rand(n, self._n_joints, device=qpos.device) * 2 - 1) * 0.1
+            qpos[idx, 7:] = self._default_joint_pos + noise
+            # Small planar velocity only. Randomising all six DOF starts the
+            # body tumbling, which dominates the velocity penalties.
+            qvel[idx, 0:2] = (torch.rand(n, 2, device=qpos.device) * 2 - 1) * 0.2
 
         self._actions[idx] = 0.0
         self._episode_length[idx] = 0
