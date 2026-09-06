@@ -213,13 +213,13 @@ class Go2Base(MuJoCoWarp):
         self._soft_joint_upper = mid + half
 
         # Torque limits from the actuator ctrlrange.
-        force_range = self._model.actuator_forcerange
-        if not self._model.actuator_forcelimited.all():
-            # Fall back to the ctrlrange magnitude only where a force limit
-            # is genuinely absent; Go2 declares ctrlrange in Nm on <motor>.
-            force_range = self._model.actuator_ctrlrange
-        self._effort_limit = torch.as_tensor(
-            np.abs(force_range).max(axis=1), dtype=torch.float32, device=dev
+
+        ctrlrange = self._model.actuator_ctrlrange
+        self._ctrl_lower = torch.as_tensor(
+            ctrlrange[:, 0], dtype=torch.float32, device=dev
+        )
+        self._ctrl_upper = torch.as_tensor(
+            ctrlrange[:, 1], dtype=torch.float32, device=dev
         )
 
         self._feet_geom_ids = torch.as_tensor(
@@ -266,7 +266,8 @@ class Go2Base(MuJoCoWarp):
         action = torch.as_tensor(action, dtype=torch.float32, device=self._device)
         action = torch.clamp(action, min=-100.0, max=100.0)
         self._actions[:] = action
-        return self._default_joint_pos + self._action_scale * action
+        target = self._default_joint_pos + self._action_scale * action
+        return torch.clamp(target, self._ctrl_lower, self._ctrl_upper)
 
     # ------------------------------------------------------------------
     # Quaternion helpers (w, x, y, z), batched over environments
@@ -320,7 +321,7 @@ class Go2Base(MuJoCoWarp):
         return wp.to_torch(self._data_wp.qvel)[:, self._leg_dof_idx]
 
     def _joint_torque(self):
-        return wp.to_torch(self._data_wp.ctrl)
+        return wp.to_torch(self._data_wp.qfrc_actuator)[:, self._leg_dof_idx]
 
     def _foot_height(self):
         """Height of each foot geom centre above the ground. (num_envs, 4)"""
