@@ -1,19 +1,20 @@
-import numpy as np
+import torch
+import warp as wp
 from pathlib import Path
-import mujoco
 
-from mushroom_rl.environments.mujoco import MuJoCo, ObservationType
+from mushroom_rl.environments.mujoco_warp import MuJoCoWarp
+from mushroom_rl.environments.mujoco import ObservationType
 from mushroom_rl.core.spaces import Box
 
 
-class Walker2D(MuJoCo):
+class Walker2DWarp(MuJoCoWarp):
     """
-    MuJoCo simulation of Walker2D task.
-
+    Mujoco WARP simulation of Walker2d task based on the Hopper environment.
     """
 
     def __init__(
         self,
+        num_envs,
         gamma=0.99,
         horizon=1000,
         forward_reward_weight=1.0,
@@ -25,15 +26,19 @@ class Walker2D(MuJoCo):
         reset_noise_scale=5e-3,
         exclude_current_positions_from_observation=True,
         n_substeps=4,
+        use_graph_capture=False,
+        nconmax=200,
+        njmax=200,
         **viewer_params,
     ):
-        """
-        Constructor.
-
-        """
         xml_path = (
-            Path(__file__).resolve().parent.parent / "data" / "walker_2d" / "model.xml"
+            Path(__file__).resolve().parent.parent.parent
+            / "mujoco_envs"
+            / "data"
+            / "walker_2d"
+            / "model.xml"
         ).as_posix()
+
         actuation_spec = [
             "thigh_joint",
             "leg_joint",
@@ -80,6 +85,7 @@ class Walker2D(MuJoCo):
         )
 
         super().__init__(
+            num_envs=num_envs,
             xml_file=xml_path,
             gamma=gamma,
             horizon=horizon,
@@ -87,97 +93,98 @@ class Walker2D(MuJoCo):
             actuation_spec=actuation_spec,
             additional_data_spec=additional_data_spec,
             n_substeps=n_substeps,
+            use_graph_capture=use_graph_capture,
+            nconmax=nconmax,
+            njmax=njmax,
             **viewer_params,
         )
 
     def _modify_mdp_info(self, mdp_info):
         if not self._exclude_current_positions_from_observation:
-            self.obs_helper.remove_obs("x_pos", 0)
+            self.obs_helper.add_obs("x_pos", 1)
         mdp_info = super()._modify_mdp_info(mdp_info)
         mdp_info.observation_space = Box(*self.obs_helper.get_obs_limits())
         return mdp_info
 
     def _create_observation(self, obs):
-        obs = super()._create_observation(obs)
-        # Clip qvels
-        obs[9:] = np.clip(obs[9:], -10, 10)
+        obs = obs.clone()
+        # obs layout: 8 position entries then 9 velocity entries; clip all velocities.
+        obs[:, 9:] = torch.clamp(obs[:, 9:], -10.0, 10.0)
         if not self._exclude_current_positions_from_observation:
             x_pos = self._read_data("x_pos")
-            obs = np.concatenate([obs, x_pos])
+            obs = torch.cat([obs, x_pos], dim=1)
         return obs
 
     def _is_within_z_range(self, obs):
-        """
-        Check if Z position of torso is within the healthy range.
-
-        """
-        z_position = self.obs_helper.get_from_obs(obs, "z_pos").item()
         min_z, max_z = self._healthy_z_range
-        return min_z < z_position < max_z
+        z_position = self.obs_helper.get_from_obs(obs, "z_pos")[:, 0]
+        return (z_position > min_z) & (z_position < max_z)
 
     def _is_within_angle_range(self, obs):
-        """
-        Check if y-angle of torso is within the healthy range.
-
-        """
-        y_angle = self.obs_helper.get_from_obs(obs, "y_pos").item()
         min_angle, max_angle = self._healthy_angle_range
-        return min_angle < y_angle < max_angle
-
-    def is_absorbing(self, obs):
-        return self._terminate_when_unhealthy and not self._is_healthy(obs)
+        y_angle = self.obs_helper.get_from_obs(obs, "y_pos")[:, 0]
+        # Wrap to [-pi, pi] before comparison, so somersault accumulation doesn't leave the
+        # angle permanently outside the healthy range.
+        y_wrapped = torch.atan2(torch.sin(y_angle), torch.cos(y_angle))
+        return (y_wrapped > min_angle) & (y_wrapped < max_angle)
 
     def _is_healthy(self, obs):
-        is_within_z_range = self._is_within_z_range(obs)
-        is_within_angle_range = self._is_within_angle_range(obs)
-        return is_within_z_range and is_within_angle_range
+        return self._is_within_z_range(obs) & self._is_within_angle_range(obs)
 
-    def _get_healthy_reward(self, obs):
-        """
-        Return the healthy reward if the agent is healthy, else 0.
-
-        """
-        return self._is_healthy(obs) * self._healthy_reward
-
-    def _get_forward_reward(self):
-        forward_reward = self._read_data("torso_vel")[3]
-        return self._forward_reward_weight * forward_reward
-
-    def _get_ctrl_cost(self, action):
-        """
-        Return the control cost.
-
-        """
-        ctrl_cost = np.sum(np.square(action))
-        return self._ctrl_cost_weight * ctrl_cost
+    def is_absorbing(self, obs):
+        return self._terminate_when_unhealthy & ~self._is_healthy(obs)
 
     def reward(self, obs, action, next_obs, absorbing):
-        healthy_reward = self._get_healthy_reward(next_obs)
-        forward_reward = self._get_forward_reward()
-        ctrl_cost = self._get_ctrl_cost(action)
-        reward = healthy_reward + forward_reward - ctrl_cost
-        return reward
+        healthy = self._is_healthy(next_obs)
+        healthy_r = healthy.float() * self._healthy_reward
 
-    def _generate_noise(self):
-        self._data.qpos[:] = self._data.qpos + np.random.uniform(
-            -self._reset_noise_scale, self._reset_noise_scale, self._model.nq
+        torso_vel = self._read_data("torso_vel")
+        forward_r = self._forward_reward_weight * torso_vel[:, 3]
+
+        action_t = torch.as_tensor(
+            action, dtype=healthy_r.dtype, device=healthy_r.device
         )
-        self._data.qvel[:] = self._data.qvel + np.random.uniform(
-            -self._reset_noise_scale, self._reset_noise_scale, self._model.nv
+        ctrl_cost = self._ctrl_cost_weight * (action_t**2).sum(dim=-1)
+
+        return healthy_r + forward_r - ctrl_cost
+
+    def setup(self, env_indices, obs):
+        super().setup(env_indices, obs)
+
+        qpos = wp.to_torch(self._data_wp.qpos)
+        qvel = wp.to_torch(self._data_wp.qvel)
+
+        device = qpos.device
+        idx = (
+            torch.as_tensor(env_indices, device=device, dtype=torch.long)
+            if not isinstance(env_indices, torch.Tensor)
+            else env_indices.to(device).long()
         )
 
-    def setup(self, obs):
-        super().setup(obs)
+        n = len(env_indices)
+        if n == 0:
+            self._mj_warp.forward(self._model_wp, self._data_wp)
+            return
 
-        self._generate_noise()
+        noise_pos = (
+            torch.rand(n, self._model.nq, device=device) * 2 - 1
+        ) * self._reset_noise_scale
+        noise_vel = (
+            torch.rand(n, self._model.nv, device=device) * 2 - 1
+        ) * self._reset_noise_scale
 
-        mujoco.mj_forward(self._model, self._data)  # type: ignore
+        qpos[idx] += noise_pos
+        qvel[idx] += noise_vel
 
-    def _create_info_dictionary(self, obs, action):
-        info = {
-            "healthy_reward": self._get_healthy_reward(obs),
-            "forward_reward": self._get_forward_reward(),
-            "ctrl_cost": self._get_ctrl_cost(action)
+        self._mj_warp.forward(self._model_wp, self._data_wp)
+
+    def _create_info_dictionary(self, obs):
+        healthy = self._is_healthy(obs)
+        healthy_r = healthy.float() * self._healthy_reward
+        torso_vel = self._read_data("torso_vel")
+
+        forward_r = self._forward_reward_weight * torso_vel[:, 3]
+        return {
+            "healthy_reward": healthy_r,
+            "forward_reward": forward_r,
         }
-
-        return info

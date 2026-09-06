@@ -1,22 +1,23 @@
+import torch
+import warp as wp
 from pathlib import Path
 
-import numpy as np
-from mushroom_rl.environments.mujoco import MuJoCo, ObservationType
+from mushroom_rl.environments.mujoco_warp import MuJoCoWarp
+from mushroom_rl.environments.mujoco import ObservationType
 from mushroom_rl.core.spaces import Box
-import mujoco
 
 
-class Ant(MuJoCo):
+class AntWarp(MuJoCoWarp):
     """
-    The Ant MuJoCo environment.
+    Mujoco WARP simulation of the Ant task.
 
     As presented in:
     "High-Dimensional Continuous Control Using Generalized Advantage Estimation". John Schulman et al. 2015.
-
     """
 
     def __init__(
         self,
+        num_envs,
         gamma=0.99,
         horizon=1000,
         forward_reward_weight=1.0,
@@ -30,15 +31,19 @@ class Ant(MuJoCo):
         n_substeps=5,
         exclude_current_positions_from_observation=True,
         use_contact_forces=False,
+        use_graph_capture=False,
+        nconmax=200,
+        njmax=200,
         **viewer_params,
     ):
-        """
-        Constructor.
+        xml_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "mujoco_envs"
+            / "data"
+            / "ant"
+            / "model.xml"
+        ).as_posix()
 
-        """
-        xml_path = (Path(__file__).resolve().parent.parent / "data" / "ant" / "model.xml").as_posix()
-
-        # This order is correct as specified in gymnasium
         actuation_spec = [
             "hip_4",
             "ankle_4",
@@ -95,6 +100,7 @@ class Ant(MuJoCo):
         self._use_contact_forces = use_contact_forces
 
         super().__init__(
+            num_envs=num_envs,
             xml_file=xml_path,
             gamma=gamma,
             horizon=horizon,
@@ -103,6 +109,9 @@ class Ant(MuJoCo):
             collision_groups=collision_groups,
             additional_data_spec=additional_data_spec,
             n_substeps=n_substeps,
+            use_graph_capture=use_graph_capture,
+            nconmax=nconmax,
+            njmax=njmax,
             **viewer_params,
         )
 
@@ -117,86 +126,89 @@ class Ant(MuJoCo):
         return mdp_info
 
     def _create_observation(self, obs):
-        obs = super()._create_observation(obs)
+        obs = obs.clone()
+
         if self._use_contact_forces:
             collision_force = self._get_collision_force("torso", "floor")
-            obs = np.concatenate([obs, collision_force])
+            obs = torch.cat([obs, collision_force], dim=1)
         return obs
 
-    def _is_finite(self):
-        states = self.get_states()
-        return np.isfinite(states).all()
+    def _is_finite(self, obs):
+        qpos = wp.to_torch(self._data_wp.qpos)
+        qvel = wp.to_torch(self._data_wp.qvel)
+        states = torch.cat([qpos, qvel], dim=1)
+        return torch.isfinite(states).all(dim=1)
 
-    def _is_within_z_range(self):
-        z_pos = self._read_data("torso_pos")[2]
+    def _is_within_z_range(self, obs):
         min_z, max_z = self._healthy_z_range
-        return min_z <= z_pos <= max_z
+        z_position = self._read_data("torso_pos")[:, 2]
+        return (z_position >= min_z) & (z_position <= max_z)
 
-    def _is_healthy(self):
-        is_healthy = self._is_finite() and self._is_within_z_range()
-        return is_healthy
+    def _is_healthy(self, obs):
+        return self._is_finite(obs) & self._is_within_z_range(obs)
 
     def is_absorbing(self, obs):
-        absorbing = self._terminate_when_unhealthy and not self._is_healthy()
-        return absorbing
-
-    def _get_healthy_reward(self, obs):
-        return self._is_healthy() * self._healthy_reward
-
-    def _get_forward_reward(self):
-        forward_reward = self._read_data("torso_vel")[3]
-        return self._forward_reward_weight * forward_reward
-
-    def _get_ctrl_cost(self, action):
-        ctrl_cost = np.sum(np.square(action))
-        return self._ctrl_cost_weight * ctrl_cost
-
-    def _get_contact_cost(self, obs):
-        collision_force = self.obs_helper.get_from_obs(obs, "collision_force")
-        contact_cost = np.sum(
-            np.square(np.clip(collision_force, *self._contact_force_range))
-        )
-        return self._contact_cost_weight * contact_cost
+        return self._terminate_when_unhealthy & ~self._is_healthy(obs)
 
     def reward(self, obs, action, next_obs, absorbing):
-        healthy_reward = self._get_healthy_reward(next_obs)
-        forward_reward = self._get_forward_reward()
-        cost = self._get_ctrl_cost(action)
-        if self._use_contact_forces:
-            contact_cost = self._get_contact_cost(next_obs)
-            cost += contact_cost
-        reward = healthy_reward + forward_reward - cost
-        return reward
+        healthy = self._is_healthy(next_obs)
+        healthy_r = healthy.float() * self._healthy_reward
 
-    def _generate_noise(self):
-        self._data.qpos[:] = self._data.qpos + np.random.uniform(
-            -self._reset_noise_scale, self._reset_noise_scale, size=self._model.nq
+        torso_vel = self._read_data("torso_vel")
+        forward_r = self._forward_reward_weight * torso_vel[:, 3]
+
+        action_t = torch.as_tensor(
+            action, dtype=healthy_r.dtype, device=healthy_r.device
+        )
+        ctrl_cost = self._ctrl_cost_weight * (action_t**2).sum(dim=-1)
+
+        cost = ctrl_cost
+        if self._use_contact_forces:
+            collision_force = self.obs_helper.get_from_obs(next_obs, "collision_force")
+            lo, hi = self._contact_force_range
+            clipped = torch.clamp(collision_force, lo, hi)
+            contact_cost = self._contact_cost_weight * (clipped**2).sum(dim=-1)
+            cost = cost + contact_cost
+
+        return healthy_r + forward_r - cost
+
+    def setup(self, env_indices, obs):
+        super().setup(env_indices, obs)
+
+        qpos = wp.to_torch(self._data_wp.qpos)
+        qvel = wp.to_torch(self._data_wp.qvel)
+
+        device = qpos.device
+        idx = (
+            torch.as_tensor(env_indices, device=device, dtype=torch.long)
+            if not isinstance(env_indices, torch.Tensor)
+            else env_indices.to(device).long()
         )
 
-        self._data.qvel[:] = self._data.qvel + self._reset_noise_scale * np.random.standard_normal(self._model.nv)
+        n = len(env_indices)
+        noise_pos = (
+            torch.rand(n, self._model.nq, device=device) * 2 - 1
+        ) * self._reset_noise_scale
+        noise_vel = (
+            torch.randn(n, self._model.nv, device=device) * self._reset_noise_scale
+        )
 
-    def setup(self, obs):
-        super().setup(obs)
+        qpos[idx] += noise_pos
+        qvel[idx] += noise_vel
 
-        self._generate_noise()
+        self._mj_warp.forward(self._model_wp, self._data_wp)
 
-        mujoco.mj_forward(self._model, self._data)  # type: ignore
-
-    def _create_info_dictionary(self, obs, action):
-        info = {
-            "healthy_reward": self._get_healthy_reward(obs),
-            "forward_reward": self._get_forward_reward(),
-            "ctrl_cost": self._get_ctrl_cost(action)
+    def _create_info_dictionary(self, obs):
+        healthy = self._is_healthy(obs)
+        healthy_r = healthy.float() * self._healthy_reward
+        torso_vel = self._read_data("torso_vel")
+        forward_r = self._forward_reward_weight * torso_vel[:, 3]
+        return {
+            "healthy_reward": healthy_r,
+            "forward_reward": forward_r,
         }
 
-        if self._use_contact_forces:
-            info["contact_cost"] = self._get_contact_cost(obs)
-
-        return info
-
     def get_states(self):
-        """
-        Return the position and velocity joint states of the model
-
-        """
-        return np.concatenate([self._data.qpos.flat, self._data.qvel.flat])
+        qpos = wp.to_torch(self._data_wp.qpos)
+        qvel = wp.to_torch(self._data_wp.qvel)
+        return torch.cat([qpos, qvel], dim=1)
