@@ -144,8 +144,23 @@ def experiment(
         L = dataset.episodes_length.float().mean().item()
         V = agent._V(dataset.get_init_states()).mean().item()
         R_step = R / max(L, 1.0)
+        qvel = wp.to_torch(mdp._data_wp.qvel)
+        quat = mdp._read_data("base_rot")
+        lin = mdp._quat_rotate_inverse(quat, qvel[:, 0:3])
+        ang = qvel[:, 3:6]
+
+        lin_err = (mdp._commands[:, :2] - lin[:, :2]).norm(dim=1).mean().item()
+        ang_err = (mdp._commands[:, 2] - ang[:, 2]).abs().mean().item()
+
         logger.log_evaluation(
-            epoch, J=J, R=R, entropy=E, mean_ep_len=L, V=V, R_per_step=R_step
+            epoch,
+            J=J,
+            R=R,
+            entropy=E,
+            mean_ep_len=L,
+            V=V,
+            lin_vel_err=lin_err,
+            ang_vel_err=ang_err,
         )
         logger.log_best_agent(agent, J)
 
