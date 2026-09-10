@@ -149,8 +149,8 @@ def experiment(
         lin = mdp._quat_rotate_inverse(quat, qvel[:, 0:3])
         ang = qvel[:, 3:6]
 
-        lin_err = (mdp._commands[:, :2] - lin[:, :2]).norm(dim=1).mean().item()
-        ang_err = (mdp._commands[:, 2] - ang[:, 2]).abs().mean().item()
+        lin_err = ((mdp._commands[:, :2] - lin[:, :2]) ** 2).sum(dim=1).mean().item()
+        ang_err = ((mdp._commands[:, 2] - ang[:, 2]) ** 2).mean().item()
 
         logger.log_evaluation(
             epoch,
