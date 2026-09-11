@@ -136,6 +136,22 @@ def experiment(
     # at deployment time.
     core = Core(agent, mdp, logger=logger)
 
+    def measure_tracking(n_steps=200):
+        mask = torch.ones(n_envs, dtype=torch.bool, device=mdp._device)
+        obs, _ = mdp.reset_all(mask)
+        lin_acc = ang_acc = 0.0
+        for _ in range(n_steps):
+            obs, *_ = mdp.step_all(mask, agent.policy.draw_action_greedy(obs))
+            qvel = wp.to_torch(mdp._data_wp.qvel)
+            quat = mdp._read_data("base_rot")
+            lin = mdp._quat_rotate_inverse(quat, qvel[:, 0:3])
+            ang = qvel[:, 3:6]
+            lin_acc += ((mdp._commands[:, :2] - lin[:, :2]) ** 2).sum(
+                dim=1
+            ).mean().item() / n_steps
+            ang_acc += ((mdp._commands[:, 2] - ang[:, 2]) ** 2).mean().item() / n_steps
+        return lin_acc, ang_acc
+
     def evaluate(epoch):
         dataset = core.evaluate(n_episodes=n_episodes_test, render=False)
         J = dataset.discounted_return.mean().item()
@@ -143,14 +159,8 @@ def experiment(
         E = agent.policy.entropy().item()
         L = dataset.episodes_length.float().mean().item()
         V = agent._V(dataset.get_init_states()).mean().item()
-        R_step = R / max(L, 1.0)
-        qvel = wp.to_torch(mdp._data_wp.qvel)
-        quat = mdp._read_data("base_rot")
-        lin = mdp._quat_rotate_inverse(quat, qvel[:, 0:3])
-        ang = qvel[:, 3:6]
 
-        lin_err = ((mdp._commands[:, :2] - lin[:, :2]) ** 2).sum(dim=1).mean().item()
-        ang_err = ((mdp._commands[:, 2] - ang[:, 2]) ** 2).mean().item()
+        lin_err, ang_err = measure_tracking()
 
         logger.log_evaluation(
             epoch,
