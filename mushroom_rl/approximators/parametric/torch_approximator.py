@@ -163,7 +163,7 @@ class TorchApproximator(Approximator):
             *args: input, where the last ``n_fit_targets`` elements are considered as the target,
                 while the others are considered as input;
             n_epochs (int, None): the number of training epochs;
-            weights (np.ndarray, None): the weights of each sample in the computation of the loss;
+            weights (torch.Tensor, None): the weights of each sample in the computation of the loss;
             epsilon (float, None): the coefficient used for early stopping;
             patience (float, 1.): the number of epochs to wait until stop the learning if not improving;
             validation_split (float, 1.): the percentage of the dataset to use as training set;
@@ -197,9 +197,10 @@ class TorchApproximator(Approximator):
 
         loss_current = list()
         for batch in batches:
-            loss_current.append(self._fit_batch(batch, use_weights, network_kwargs))
+            loss_batch = self._fit_batch(batch, use_weights, network_kwargs)
+            loss_current.append(loss_batch)
 
-        return np.mean(loss_current)
+        return torch.stack(loss_current).mean().item()
 
     def _fit_batch(self, batch, use_weights, network_kwargs):
         loss = self._compute_batch_loss(batch, use_weights, network_kwargs)
@@ -208,7 +209,7 @@ class TorchApproximator(Approximator):
         loss.backward()
         self._optimizer.step()
 
-        return loss.item()
+        return loss.detach()
 
     def _compute_batch_loss(self, batch, use_weights, network_kwargs):
         if use_weights:
@@ -488,7 +489,7 @@ class TorchEnsemble(Ensemble):
                 while the others are considered as input;
             idx (int, None): if provided, fit only the model at that index;
             n_epochs (int, None): the number of training epochs;
-            weights (np.ndarray, None): the weights of each sample in the computation of the loss;
+            weights (torch.Tensor, None): the weights of each sample in the computation of the loss;
             epsilon (float, None): the coefficient used for early stopping;
             patience (float, 1.): the number of epochs to wait until stop the learning if not improving;
             validation_split (float, 1.): the percentage of the dataset to use as training set;
@@ -537,7 +538,7 @@ class TorchEnsemble(Ensemble):
         for batch in batches:
             loss_current.append(self._fit_batch(batch, use_weights, network_kwargs))
 
-        return np.mean(loss_current, axis=0)
+        return torch.stack(loss_current).mean(dim=0).tolist()
 
     def _fit_batch(self, stacked_batch, use_weights, network_kwargs):
         self._sync_params()
@@ -587,7 +588,7 @@ class TorchEnsemble(Ensemble):
             m._optimizer.step()
             m._dirty = True
 
-        return per_model_losses.detach().cpu().numpy()
+        return per_model_losses.detach()
 
     def _compute_val_loss(self, val_args, use_weights, network_kwargs):
         if use_weights:

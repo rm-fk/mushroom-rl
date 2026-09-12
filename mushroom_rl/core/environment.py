@@ -9,7 +9,7 @@ class MDPInfo(MushroomObject):
     This class is used to store the information of the environment.
 
     """
-    def __init__(self, observation_space, action_space, gamma, horizon, dt=1e-1, backend='numpy'):
+    def __init__(self, observation_space, action_space, gamma, horizon, dt=1e-1, backend='numpy', device=None):
         """
         Constructor.
 
@@ -19,15 +19,19 @@ class MDPInfo(MushroomObject):
              gamma (float): the discount factor;
              horizon (int): the horizon;
              dt (float, 1e-1): the control timestep of the environment;
-             backend (str, 'numpy'): the type of data library used to generate state and actions.
+             backend (str, 'numpy'): the type of data library used to generate state and actions;
+             device (str, None): device the environment data is stored on, only allowed with the torch backend.
 
         """
+        assert backend == 'torch' or device is None
+
         self.observation_space = observation_space
         self.action_space = action_space
         self.gamma = gamma
         self.horizon = horizon
         self.dt = dt
         self.backend = backend
+        self.device = device
 
         self._add_save_attr(
             observation_space='mushroom',
@@ -35,7 +39,8 @@ class MDPInfo(MushroomObject):
             gamma='primitive',
             horizon='primitive',
             dt='primitive',
-            backend='primitive'
+            backend='primitive',
+            device='primitive'
         )
 
     @property
@@ -112,7 +117,7 @@ class Environment(object):
         Generate an environment given an environment name and parameters.
         The environment is created using the generate method, if available. Otherwise, the constructor is used.
         The generate method has a simpler interface than the constructor, making it easier to generate a standard
-        version of the environment. If the environment name contains a '.' separator, the string is splitted, the first
+        version of the environment. If the environment name contains a '.' separator, the string is split, the first
         element is used to select the environment and the other elements are passed as positional parameters.
 
         Args:
