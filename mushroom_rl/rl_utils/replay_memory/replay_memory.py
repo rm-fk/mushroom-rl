@@ -72,7 +72,7 @@ class ReplayMemory(MushroomObject):
         assert not self._dataset.is_stateful or dataset.is_stateful, \
             "The replay memory is configured to store the policy state, but the dataset does not provide it."
 
-        dataset = dataset.to_backend(self._agent_info.backend)
+        dataset = dataset.to_backend(self._agent_info.backend, device=self._agent_info.device)
         self._write_to_buffer(dataset)
 
     def get(self, n_samples):
@@ -133,11 +133,17 @@ class ReplayMemory(MushroomObject):
 
         """
         ds = self._dataset
-        state, action, reward, next_state, absorbing, last, extra = \
-            self._history_manager.parse_nstep_history_circular_buffer(
-                ds, idxs, self._mdp_info.gamma, self._n_steps_return, len(ds), self._full, self._max_size, self._idx)
-        anchor = extra.pop('anchor')
-        endpoint = extra.pop('endpoint')
+        size = len(ds)
+        if self._n_steps_return > 1:
+            state, action, reward, next_state, absorbing, last, extra = \
+                self._history_manager.parse_nstep_history_circular_buffer(
+                    ds, idxs, self._mdp_info.gamma, self._n_steps_return, size, self._full, self._max_size, self._idx)
+            anchor = extra.pop('anchor')
+            endpoint = extra.pop('endpoint')
+        else:
+            state, action, reward, next_state, absorbing, last, extra = \
+                self._history_manager.parse_history_circular_buffer(ds, idxs, size, self._full, self._max_size)
+            anchor = endpoint = idxs
 
         policy_state = [ds.policy_state[anchor], ds.policy_next_state[endpoint]] if ds.is_stateful else []
 
@@ -163,10 +169,10 @@ class ReplayMemory(MushroomObject):
         backend = self._dataset.array_backend
         size = len(self._dataset)
         if self._history_manager.max_reach == 0 and self._n_steps_return == 1:
-            return backend.randint(0, size, (n_samples,))
-        idxs = backend.arange(0, size)
+            return backend.randint(0, size, (n_samples,), device=self._agent_info.device)
+        idxs = backend.arange(0, size, device=self._agent_info.device)
         valid = idxs[~self._compute_mask(idxs)]
-        return valid[backend.randint(0, len(valid), (n_samples,))]
+        return valid[backend.randint(0, len(valid), (n_samples,), device=self._agent_info.device)]
 
     def _affected_window(self, positions):
         """
@@ -188,7 +194,8 @@ class ReplayMemory(MushroomObject):
         size = len(self._dataset)
         history_reserve = self._history_manager.max_reach if self._full else 0
         window_length = len(positions) + (self._n_steps_return - 1) + history_reserve
-        raw = (positions[0] - (self._n_steps_return - 1)) + backend.arange(0, window_length)
+        range_vec = backend.arange(0, window_length, device=self._agent_info.device)
+        raw = (positions[0] - (self._n_steps_return - 1)) + range_vec
         if self._full:
             return raw % self._max_size
         return raw[(raw >= 0) & (raw < size)]
@@ -207,7 +214,7 @@ class ReplayMemory(MushroomObject):
 
         """
         backend = self._dataset.array_backend
-        mask = backend.zeros(len(anchor_idxs), dtype=bool)
+        mask = backend.zeros(len(anchor_idxs), dtype=bool, device=self._agent_info.device)
         if self._n_steps_return > 1:
             valid = self._history_manager.nstep_valid_circular_buffer(
                 self._dataset.absorbing, self._dataset.last, anchor_idxs, self._n_steps_return,
@@ -234,7 +241,7 @@ class ReplayMemory(MushroomObject):
         """
         n = len(dataset)
         backend = self._dataset.array_backend
-        positions = (backend.arange(0, n) + self._idx) % self._max_size
+        positions = (backend.arange(0, n, device=self._agent_info.device) + self._idx) % self._max_size
 
         if not self._full:
             remaining = self._max_size - len(self._dataset)
