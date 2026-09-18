@@ -18,11 +18,10 @@ class VectorizedEnvironment(Environment):
         Reset the state of the default environment, leaving the other copies untouched.
 
         Args:
-            state (np.ndarray, None): the optional initial state to impose to the default environment.
+            state (Array, None): the optional initial state to impose to the default environment.
 
         Returns:
-            The states of all the environments, and a list of episode info dictionaries, one per environment.
-            Only the entries of the default environment are updated by this call.
+            The initial state of the default environment, and its episode info dictionary.
 
         """
         arraybackend = ArrayBackend.get_array_backend(self._mdp_info.backend)
@@ -35,7 +34,9 @@ class VectorizedEnvironment(Environment):
         else:
             states = None
 
-        return self.reset_all(env_mask, states)
+        states, episode_infos = self.reset_all(env_mask, states)
+
+        return states[self._default_env], self._default_env_info(episode_infos)
 
     def step(self, action):
         """
@@ -43,12 +44,11 @@ class VectorizedEnvironment(Environment):
         untouched.
 
         Args:
-            action (np.ndarray): the action to execute in the default environment.
+            action (Array): the action to execute in the default environment.
 
         Returns:
-            The states reached by all the environments, the rewards obtained, the absorbing flags, and a list of
-            step info dictionaries, one per environment. Only the entries of the default environment are updated
-            by this call.
+            The state reached by the default environment, the reward obtained, the absorbing flag, and its step
+            info dictionary.
 
         """
         arraybackend = ArrayBackend.get_array_backend(self._mdp_info.backend)
@@ -58,14 +58,25 @@ class VectorizedEnvironment(Environment):
         actions = arraybackend.zeros(self._n_envs, *arraybackend.shape(action), device=self._mdp_info.device)
         actions[self._default_env] = action
 
-        return self.step_all(env_mask, actions)
+        next_states, rewards, absorbings, step_infos = self.step_all(env_mask, actions)
+
+        return (next_states[self._default_env], rewards[self._default_env], absorbings[self._default_env],
+                self._default_env_info(step_infos))
 
     def render(self, record=False):
-        arraybackend = ArrayBackend.get_array_backend(self._mdp_info.backend)
-        env_mask = arraybackend.zeros(self._n_envs, dtype=bool, device=self._mdp_info.device)
+        array_backend = ArrayBackend.get_array_backend(self._mdp_info.backend)
+        env_mask = array_backend.zeros(self._n_envs, dtype=bool, device=self._mdp_info.device)
         env_mask[self._default_env] = True
 
-        return self.render_all(env_mask, record=record)
+        frame = self.render_all(env_mask, record=record)
+
+        if not record:
+            return None
+
+        if frame is not None and frame.ndim == 4:
+            frame = frame[0]
+
+        return frame
 
     def reset_all(self, env_mask, state=None):
         """
@@ -76,7 +87,7 @@ class VectorizedEnvironment(Environment):
             state: set of initial states to impose to the environment.
 
         Returns:
-            The initial states of all environments and a list of episode info dictionaries
+            The initial states of all the selected environments, and a list of episode info dictionaries.
 
         """
         raise NotImplementedError
@@ -90,7 +101,8 @@ class VectorizedEnvironment(Environment):
             action: set of actions to execute.
 
         Returns:
-            The initial states of all environments and a list of step info dictionaries
+            The next states of all the selected environments, the rewards obtained, the absorbing flags, and
+            a list of step info dictionaries.
 
         """
         raise NotImplementedError
@@ -103,7 +115,8 @@ class VectorizedEnvironment(Environment):
             record (bool, False): whether the visualized images should be returned or not.
 
         Returns:
-            The visualized images, or None if the record flag is set to false.
+            The visualized images of all the selected environments, or None if the record flag is set to
+            false.
 
         """
         raise NotImplementedError
@@ -123,3 +136,18 @@ class VectorizedEnvironment(Environment):
     @property
     def number(self):
         return self._n_envs
+
+    def _default_env_info(self, info):
+        """
+        Args:
+            info (dict, list): the information of every environment, either as a list of dictionaries, one per
+                environment, or as a dictionary of arrays.
+
+        Returns:
+            The information of the default environment, as a dictionary.
+
+        """
+        if isinstance(info, dict):
+            return {key: value[self._default_env] for key, value in info.items()}
+
+        return info[self._default_env]

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from mushroom_rl.rl_utils.running_stats import (
     RunningStandardization, RunningExpWeightedAverage, RunningAveragedWindow
@@ -67,6 +68,64 @@ def test_running_averaged_window_reset():
         raw.update_stats(np.array([float(i), float(i * 2)]))
     raw.reset()
     assert np.allclose(raw.mean, [0., 0.])
+
+
+def test_running_stats_save_the_arrays_with_the_backend_method(tmpdir):
+    standardization = RunningStandardization(shape=(2,), backend='torch')
+    standardization.update_stats(torch.ones(1, 2))
+
+    average = RunningExpWeightedAverage(shape=(2,), alpha=0.1, backend='torch')
+    average.update_stats(torch.ones(2))
+
+    assert standardization._save_attributes['_m'] == 'torch'
+    assert standardization._save_attributes['_s'] == 'torch'
+    assert average._save_attributes['_avg_value'] == 'torch'
+
+    standardization.save(tmpdir / 'standardization.msh')
+    average.save(tmpdir / 'average.msh')
+
+    loaded_standardization = RunningStandardization.load(tmpdir / 'standardization.msh')
+    loaded_average = RunningExpWeightedAverage.load(tmpdir / 'average.msh')
+
+    assert torch.equal(loaded_standardization.mean, standardization.mean)
+    assert torch.equal(loaded_standardization.std, standardization.std)
+    assert torch.equal(loaded_average.mean, average.mean)
+
+    numpy_standardization = RunningStandardization(shape=(2,), backend='numpy')
+
+    assert numpy_standardization._save_attributes['_m'] == 'numpy'
+
+
+def test_running_stats_allocate_on_the_requested_device():
+    if not torch.cuda.is_available():
+        return
+
+    standardization = RunningStandardization(shape=(2,), backend='torch', device='cuda')
+    standardization.update_stats(torch.ones(1, 2, device='cuda'))
+
+    assert standardization.mean.device.type == 'cuda'
+    assert standardization.std.device.type == 'cuda'
+
+    average = RunningExpWeightedAverage(shape=(2,), alpha=0.1, backend='torch', device='cuda')
+    average.update_stats(torch.ones(2, device='cuda'))
+
+    assert average.mean.device.type == 'cuda'
+
+    initialized_average = RunningExpWeightedAverage(shape=(2,), alpha=0.1, backend='torch',
+                                                    init_value=np.ones(2), device='cuda')
+
+    assert initialized_average.mean.device.type == 'cuda'
+
+
+def test_running_stats_reject_a_device_on_the_numpy_backend():
+    with pytest.raises(ValueError):
+        RunningStandardization(shape=(2,), backend='numpy', device='cuda')
+
+    with pytest.raises(ValueError):
+        RunningExpWeightedAverage(shape=(2,), alpha=0.1, backend='numpy', device='cuda')
+
+    with pytest.raises(ValueError):
+        RunningAveragedWindow(shape=(2,), window_size=5, backend='numpy', device='cuda')
 
 
 def test_running_standardization_reset_matches_a_fresh_instance():
